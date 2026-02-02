@@ -69,12 +69,13 @@ wss.on("connection", ws => {
 
   console.log(`✨ New Guest Connected: ${userId}`);
 
-  // 3. SEND WELCOME MESSAGE
+// 3. SEND WELCOME MESSAGE
   ws.send(JSON.stringify({ 
     type: "WELCOME", 
     userId: userId, 
     balance: 1000,
-    gameState: gameState 
+    gameState: gameState,
+    currentMultiplier: currentMultiplier // ✅ ADDED: Send current plane position
   }));
 
   ws.on("message", async (message) => {
