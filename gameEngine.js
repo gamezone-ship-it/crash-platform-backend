@@ -60,7 +60,7 @@ function crash() {
     multiplier: Number(currentMultiplier.toFixed(2))
   });
 
-  setTimeout(startRound, 3000);
+  setTimeout(startRound, 5000);
 }
 
 module.exports = {
