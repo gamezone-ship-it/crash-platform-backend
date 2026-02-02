@@ -18,40 +18,27 @@ const wss = new WebSocketServer({ server });
 const PORT = process.env.PORT || 3000;
 
 /* ───────────── SUPABASE ───────────── */
-
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-/* ───────────── GAME STATE ───────────── */
+/* ───────────── GUEST SESSIONS (IN-MEMORY DB) ───────────── */
+const guestSessions = {};
 
+/* ───────────── GAME STATE ───────────── */
 let gameState = "WAITING";
 let currentMultiplier = 1.0;
 let crashPoint = null;
 let currentRoundId = null;
 
-let activeBets = {}; // userId → { amount, cashedOut }
-
 /* ───────────── PROVABLY FAIR ───────────── */
-
 const clientSeed = "demo-client";
 let serverSeed = "";
-let serverSeedHash = "";
 
-/* ───────────── HELPERS ───────────── */
-
-function generateServerSeed() {
-  return crypto.randomBytes(32).toString("hex");
-}
-
-function sha256(data) {
-  return crypto.createHash("sha256").update(data).digest("hex");
-}
-
-function hmacSha256(key, message) {
-  return crypto.createHmac("sha256", key).update(message).digest("hex");
-}
+function generateServerSeed() { return crypto.randomBytes(32).toString("hex"); }
+function sha256(data) { return crypto.createHash("sha256").update(data).digest("hex"); }
+function hmacSha256(key, message) { return crypto.createHmac("sha256", key).update(message).digest("hex"); }
 
 function calculateCrashPoint(serverSeed, clientSeed) {
   const hmac = hmacSha256(serverSeed, clientSeed);
@@ -61,15 +48,105 @@ function calculateCrashPoint(serverSeed, clientSeed) {
   return Math.max(1, Math.floor((max / (max - intVal)) * 100) / 100);
 }
 
-/* ───────────── WEBSOCKET ───────────── */
-
+/* ───────────── WEBSOCKET BROADCAST ───────────── */
 function broadcast(data) {
   const msg = JSON.stringify(data);
   wss.clients.forEach(c => c.readyState === 1 && c.send(msg));
 }
 
+/* ───────────── CONNECTION HANDLER ───────────── */
 wss.on("connection", ws => {
-  ws.send(JSON.stringify({ type: "STATE", state: gameState }));
+  
+  // 1. GENERATE UNIQUE GUEST ID
+  const userId = "Guest_" + crypto.randomBytes(3).toString("hex").toUpperCase();
+  
+  // 2. INITIALIZE THEIR SESSION (1000 Coins)
+  guestSessions[userId] = {
+    balance: 1000,
+    activeBet: null, 
+    cashedOut: false
+  };
+
+  console.log(`✨ New Guest Connected: ${userId}`);
+
+  // 3. SEND WELCOME MESSAGE
+  ws.send(JSON.stringify({ 
+    type: "WELCOME", 
+    userId: userId, 
+    balance: 1000,
+    gameState: gameState 
+  }));
+
+  ws.on("message", async (message) => {
+    try {
+      const parsed = JSON.parse(message);
+
+      // ─── INSTANT BET LOGIC ───
+      if (parsed.type === "PLACE_BET") {
+        const { amount } = parsed;
+        const session = guestSessions[userId]; 
+
+        if (gameState !== "WAITING") {
+          return ws.send(JSON.stringify({ type: "ERROR", message: "Betting closed" }));
+        }
+        if (session.activeBet !== null) {
+          return ws.send(JSON.stringify({ type: "ERROR", message: "Already bet" }));
+        }
+        if (session.balance < amount) {
+          return ws.send(JSON.stringify({ type: "ERROR", message: "Insufficient balance" }));
+        }
+
+        // Deduct Balance in RAM
+        session.balance -= amount;
+        session.activeBet = amount;
+        session.cashedOut = false;
+
+        // ✅ DATABASE CODE REMOVED COMPLETELY
+        // We do NOT save to Supabase here anymore.
+
+        // Send Success to Client
+        ws.send(JSON.stringify({ 
+          type: "BET_CONFIRMED", 
+          amount, 
+          balance: session.balance 
+        }));
+      }
+
+      // ─── INSTANT CASHOUT LOGIC ───
+      if (parsed.type === "CASHOUT") {
+        const session = guestSessions[userId]; 
+
+        if (gameState !== "RUNNING" || !session.activeBet || session.cashedOut) {
+          return ws.send(JSON.stringify({ type: "ERROR", message: "Cashout failed" }));
+        }
+
+        session.cashedOut = true;
+        const win = +(session.activeBet * currentMultiplier).toFixed(2);
+        
+        // Add Winnings in RAM
+        session.balance += win;
+
+        // ✅ DATABASE CODE REMOVED COMPLETELY
+
+        // Send Success to Client
+        ws.send(JSON.stringify({ 
+          type: "CASHOUT_CONFIRMED", 
+          multiplier: currentMultiplier, 
+          win,
+          balance: session.balance 
+        }));
+
+        console.log(`💰 ${userId} Cashed out: +${win}`);
+      }
+
+    } catch (err) {
+      console.error("WS Message Error", err);
+    }
+  });
+
+  ws.on("close", () => {
+    // console.log(`👋 Guest Disconnected: ${userId}`);
+  });
 });
 
 /* ───────────── GAME LOOP ───────────── */
@@ -77,44 +154,40 @@ wss.on("connection", ws => {
 async function startNewRound() {
   console.log(`🟢 Round started`);
 
-  activeBets = {};
+  // RESET BETS FOR ALL GUESTS IN RAM
+  for (const id in guestSessions) {
+    guestSessions[id].activeBet = null;
+    guestSessions[id].cashedOut = false;
+  }
+
   currentMultiplier = 1;
   gameState = "WAITING";
 
   broadcast({ type: "STATE", state: "WAITING" });
 
-  let waitSeconds = 5;
-
-  broadcast({
-    type: "WAITING_TICK",
-    seconds: waitSeconds
-  });
+  let waitSeconds = 5; 
+  broadcast({ type: "WAITING_TICK", seconds: waitSeconds });
 
   const waitTimer = setInterval(() => {
     waitSeconds--;
-
     if (waitSeconds > 0) {
-      broadcast({
-        type: "WAITING_TICK",
-        seconds: waitSeconds
-      });
+      broadcast({ type: "WAITING_TICK", seconds: waitSeconds });
     } else {
       clearInterval(waitTimer);
     }
   }, 1000);
   
   serverSeed = generateServerSeed();
-  serverSeedHash = sha256(serverSeed);
   crashPoint = calculateCrashPoint(serverSeed, clientSeed);
 
-  console.log("🔐 Server seed hash:", serverSeedHash);
   console.log("💥 Crash point:", crashPoint);
 
+  // We log the ROUND itself (this is fine, no User ID involved)
   const { data, error } = await supabase
     .from("rounds")
     .insert({
       server_seed: serverSeed,
-      server_seed_hash: serverSeedHash,
+      server_seed_hash: sha256(serverSeed),
       client_seed: clientSeed,
       crash_point: crashPoint,
       started_at: new Date()
@@ -122,18 +195,11 @@ async function startNewRound() {
     .select()
     .single();
 
-  if (error) {
-    console.error("❌ Round insert failed:", error);
-    return;
-  }
-
-  console.log("✅ Round row created:", data);
-
-  currentRoundId = data.id;
+  if (!error) currentRoundId = data.id;
 
   broadcast({
     type: "ROUND_START",
-    serverSeedHash,
+    serverSeedHash: sha256(serverSeed),
     clientSeed
   });
 
@@ -158,150 +224,31 @@ function startCrash() {
 async function handleCrash() {
   gameState = "CRASHED";
 
-  broadcast({ type: "STATE", state: "CRASHED" }); // ✅ ADD THIS
-  broadcast({ type: "CRASH", crashPoint, serverSeed });
+  broadcast({ type: "STATE", state: "CRASHED" }); 
+  broadcast({ type: "CRASH", crashPoint });
 
-  await supabase
-    .from("rounds")
-    .update({ ended_at: new Date() })
-    .eq("id", currentRoundId);
+  // Close the Round in DB
+  if (currentRoundId) {
+    await supabase
+      .from("rounds")
+      .update({ ended_at: new Date() })
+      .eq("id", currentRoundId);
+  }
 
-  await supabase
-    .from("bets")
-    .update({ status: "lost" })
-    .eq("round_id", currentRoundId)
-    .eq("status", "placed");
+  // ✅ DATABASE CODE REMOVED (No longer updating 'lost' bets in DB)
 
-  setTimeout(startNewRound, 5000);
+  setTimeout(startNewRound, 3000);
 }
 
-/* ───────────── API ROUTES ───────────── */
-
-app.get("/balance/:userId", async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const { data, error } = await supabase
-      .from("balances")
-      .select("balance")
-      .eq("user_id", userId)
-      .single();
-
-    if (error || !data) {
-      return res.status(404).json({ error: "Balance not found" });
-    }
-
-    res.json({ balance: data.balance });
-  } catch (err) {
-    console.error("❌ /balance error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.post("/bet", async (req, res) => {
-  try {
-    const { userId, amount } = req.body;
-
-    if (gameState !== "WAITING") {
-      return res.status(400).json({ error: "Betting closed" });
-    }
-
-    if (!currentRoundId) {
-      return res.status(400).json({ error: "Round not ready" });
-    }
-
-    if (!userId || amount <= 0) {
-      return res.status(400).json({ error: "Invalid bet" });
-    }
-
-    if (activeBets[userId]) {
-      return res.status(400).json({ error: "Already bet" });
-    }
-
-    const { data: bal } = await supabase
-      .from("balances")
-      .select("balance")
-      .eq("user_id", userId)
-      .single();
-
-    if (!bal || bal.balance < amount) {
-      return res.status(400).json({ error: "Insufficient balance" });
-    }
-
-    const { error: betError } = await supabase.from("bets").insert({
-      round_id: currentRoundId,
-      user_id: userId,
-      bet_amount: amount,
-      status: "placed"
-    });
-
-    if (betError) {
-      console.error("❌ Bet insert failed:", betError);
-      return res.status(500).json({ error: "Bet insert failed" });
-    }
-
-    await supabase
-      .from("balances")
-      .update({ balance: bal.balance - amount })
-      .eq("user_id", userId);
-
-    activeBets[userId] = { amount, cashedOut: false };
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("❌ /bet error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.post("/cashout", async (req, res) => {
-  try {
-    const { userId } = req.body;
-    const bet = activeBets[userId];
-
-    if (gameState !== "RUNNING" || !bet || bet.cashedOut) {
-      return res.status(400).json({ error: "Invalid cashout" });
-    }
-
-    bet.cashedOut = true;
-    const win = +(bet.amount * currentMultiplier).toFixed(2);
-
-    const { error: cashoutError } = await supabase
-      .from("bets")
-      .update({
-        cashout_multiplier: currentMultiplier,
-        win_amount: win,
-        status: "won" // ✅ valid DB value
-      })
-      .eq("round_id", currentRoundId)
-      .eq("user_id", userId);
-
-    if (cashoutError) {
-      console.error("❌ Cashout update failed:", cashoutError);
-      return res.status(500).json({ error: "Cashout failed" });
-    }
-
-    console.log(`💰 Cashed out at ${currentMultiplier}x → ${win}`);
-    const { data: bal } = await supabase
-      .from("balances")
-      .select("balance")
-      .eq("user_id", userId)
-      .single();
-
-    await supabase
-      .from("balances")
-      .update({ balance: bal.balance + win })
-      .eq("user_id", userId);
-
-    res.json({ success: true, multiplier: currentMultiplier, win });
-  } catch (err) {
-    console.error("❌ /cashout error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
+/* ───────────── ADMIN DASHBOARD ───────────── */
+app.get("/admin/users", (req, res) => {
+  res.json({
+    active_users: Object.keys(guestSessions).length,
+    users: guestSessions
+  });
 });
 
 /* ───────────── START ───────────── */
-
 server.listen(PORT, () => {
   console.log(`🚀 Backend running on port ${PORT}`);
   startNewRound();
