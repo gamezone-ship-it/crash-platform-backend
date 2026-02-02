@@ -83,7 +83,7 @@ async function startNewRound() {
 
   broadcast({ type: "STATE", state: "WAITING" });
 
-  let waitSeconds = 3;
+  let waitSeconds = 5;
 
   broadcast({
     type: "WAITING_TICK",
@@ -172,7 +172,7 @@ async function handleCrash() {
     .eq("round_id", currentRoundId)
     .eq("status", "placed");
 
-  setTimeout(startNewRound, 3000);
+  setTimeout(startNewRound, 5000);
 }
 
 /* ───────────── API ROUTES ───────────── */
