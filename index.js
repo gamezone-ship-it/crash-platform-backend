@@ -40,12 +40,25 @@ function generateServerSeed() { return crypto.randomBytes(32).toString("hex"); }
 function sha256(data) { return crypto.createHash("sha256").update(data).digest("hex"); }
 function hmacSha256(key, message) { return crypto.createHmac("sha256", key).update(message).digest("hex"); }
 
+// ✅ UPDATED: CASINO LOGIC (HOUSE EDGE)
 function calculateCrashPoint(serverSeed, clientSeed) {
   const hmac = hmacSha256(serverSeed, clientSeed);
   const hex = hmac.slice(0, 13);
   const intVal = parseInt(hex, 16);
   const max = Math.pow(2, 52);
-  return Math.max(1, Math.floor((max / (max - intVal)) * 100) / 100);
+  
+  // 1. Calculate "Fair" Probability (Standard Math)
+  const fairMultiplier = max / (max - intVal);
+
+  // 2. Apply House Edge (e.g., 4%)
+  // This reduces every multiplier slightly.
+  // Example: A fair 1.03x becomes 0.98x (Instant Crash)
+  const HOUSE_EDGE = 0.04; 
+  const casinoMultiplier = fairMultiplier * (1 - HOUSE_EDGE);
+
+  // 3. Return Result (Floored to 2 decimals, minimum 1.00)
+  // If result is < 1.00, it snaps to 1.00 (Instant Loss)
+  return Math.max(1, Math.floor(casinoMultiplier * 100) / 100);
 }
 
 /* ───────────── WEBSOCKET BROADCAST ───────────── */
@@ -69,13 +82,13 @@ wss.on("connection", ws => {
 
   console.log(`✨ New Guest Connected: ${userId}`);
 
-// 3. SEND WELCOME MESSAGE
+  // 3. SEND WELCOME MESSAGE
   ws.send(JSON.stringify({ 
     type: "WELCOME", 
     userId: userId, 
     balance: 1000,
     gameState: gameState,
-    currentMultiplier: currentMultiplier // ✅ ADDED: Send current plane position
+    currentMultiplier: currentMultiplier 
   }));
 
   ws.on("message", async (message) => {
@@ -102,9 +115,6 @@ wss.on("connection", ws => {
         session.activeBet = amount;
         session.cashedOut = false;
 
-        // ✅ DATABASE CODE REMOVED COMPLETELY
-        // We do NOT save to Supabase here anymore.
-
         // Send Success to Client
         ws.send(JSON.stringify({ 
           type: "BET_CONFIRMED", 
@@ -126,8 +136,6 @@ wss.on("connection", ws => {
         
         // Add Winnings in RAM
         session.balance += win;
-
-        // ✅ DATABASE CODE REMOVED COMPLETELY
 
         // Send Success to Client
         ws.send(JSON.stringify({ 
@@ -235,8 +243,6 @@ async function handleCrash() {
       .update({ ended_at: new Date() })
       .eq("id", currentRoundId);
   }
-
-  // ✅ DATABASE CODE REMOVED (No longer updating 'lost' bets in DB)
 
   setTimeout(startNewRound, 3000);
 }
